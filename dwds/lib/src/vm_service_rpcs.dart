@@ -360,7 +360,7 @@ class Service {
       ..kind = EventKind.kResume
       ..isolate = isolateRef);
     _vm = VM()
-      ..isolates.add(isolateRef)
+      ..isolates = [isolateRef]
       // TODO(vsm): This should be the DDC version, not the VM one.
       ..version = Platform.version;
 
@@ -629,6 +629,16 @@ class RpcError implements Exception {
   String message;
 
   RpcErrorData data;
+
+  Map<String, dynamic> toJson() => {
+        'code': code,
+        'message': message,
+        'data': {
+          'type': 'RpcErrorData',
+          'details': data.details,
+        },
+        'type': 'RpcError',
+      };
 }
 
 // Dart Location data corresponding to a single JS Script.
