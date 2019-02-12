@@ -14,18 +14,15 @@ import 'package:vm_service_lib/vm_service_lib.dart';
 
 typedef StreamNotifier = void Function(String, Event);
 
-/**
- * This is based on the Dart VM Service Protocol:
- * https://github.com/dart-lang/sdk/blob/master/runtime/vm/service/service.md
- *
- * Version 3.13
- */
-
+/// This is based on the Dart VM Service Protocol:
+/// https://github.com/dart-lang/sdk/blob/master/runtime/vm/service/service.md
+///
+/// Version 3.13
 class Service {
   Future<Breakpoint> _addBreakpoint(
       String isolateId, ScriptRef script, int line,
       {int column}) async {
-    var isolate = _getIsolate(isolateId) as Isolate;
+    var isolate = _getIsolate(isolateId);
     var jsId = _dartIdToJsId[script.id];
     var locations = _jsIdToLocationData[jsId];
     var locationData = locations.dartLocations[script.uri];
@@ -72,6 +69,7 @@ class Service {
         return breakpoint;
       }
     }
+    throw RpcError(102)..data.details = 'Unable to match a dart line location';
   }
 
   Future<Breakpoint> addBreakpoint(String isolateId, String scriptId, int line,
@@ -93,10 +91,16 @@ class Service {
   Future<Breakpoint> addBreakpointWithScriptUri(
       String isolateId, String scriptUri, int line,
       {int column}) async {
-    var isolate = _getIsolate(isolateId) as Isolate;
+    var isolate = _getIsolate(isolateId);
     scriptUri = _convertToBrowserUrl(isolate, scriptUri) ?? scriptUri;
     var script = _dartUrlToScript[scriptUri];
-    return _addBreakpoint(isolateId, script.toRef(), line, column: column);
+    return _addBreakpoint(
+        isolateId,
+        ScriptRef()
+          ..id = script.id
+          ..type = '@Script',
+        line,
+        column: column);
   }
 
   String _convertToBrowserUrl(Isolate isolate, String fileUrl) {
@@ -108,7 +112,7 @@ class Service {
     for (var i = parts.length - 1; i > 0; --i) {
       var part = parts[i];
       if (part == 'lib') {
-        var package = parts[i - 1];
+        // var package = parts[i - 1];
         suffix = p.joinAll(parts.sublist(i +
             1)); // p.join('packages', package, p.joinAll(parts.sublist(i + 1)));
         break;
@@ -118,7 +122,7 @@ class Service {
     }
     if (suffix == null) return null;
 
-    var libraries = isolate.getLibraries();
+    var libraries = isolate.libraries;
     var lib = libraries.firstWhere((lib) => lib.uri.endsWith(suffix),
         orElse: () => null);
     return lib?.uri;
@@ -150,21 +154,15 @@ class Service {
     throw UnimplementedError('getFlagList');
   }
 
-  Object _getIsolate(String isolateId) {
-    var isolate = _vm
-        .getIsolates()
-        .firstWhere((i) => i.id == isolateId, orElse: () => null);
+  Isolate _getIsolate(String isolateId) =>
+      _realIsolatesById[isolateId]; // ?? Sentinel();
 
-    return isolate ?? Sentinel();
-  }
-
-  Future<Object> /*Isolate|Sentinel*/ getIsolate(String isolateId) async {
-    return _getIsolate(isolateId);
-  }
+  Future<Isolate> /*Isolate|Sentinel*/ getIsolate(String isolateId) async =>
+      _getIsolate(isolateId);
 
   List<ScriptRef> _getScripts(String isolateId) {
-    Isolate isolate = _getIsolate(isolateId);
-    var libraries = isolate.getLibraries();
+    var isolate = _getIsolate(isolateId);
+    var libraries = _realLibrariesByIsolateId[isolate.id];
     var scripts = <ScriptRef>[];
     for (var lib in libraries) {
       scripts.addAll(lib.scripts);
@@ -227,20 +225,20 @@ class Service {
   }
 
   Future<Success> resume(String isolateId,
-      {StepOption step, int frameIndex}) async {
+      {String step, int frameIndex}) async {
     // TODO(vsm): Support multiple isolates.
     if (_vm.isolates.first.id == isolateId) {
       if (step == null) {
         await _cdp.debugger.resume();
       } else {
         switch (step) {
-          case StepOption.Into:
+          case StepOption.kInto:
             await _cdp.debugger.stepInto();
             break;
-          case StepOption.Out:
+          case StepOption.kOut:
             await _cdp.debugger.stepOut();
             break;
-          case StepOption.Over:
+          case StepOption.kOver:
             await _cdp.debugger.stepOver();
             break;
           default:
@@ -251,17 +249,16 @@ class Service {
     return Success();
   }
 
-  Future<Success> setExceptionPauseMode(
-      String isolateId, ExceptionPauseMode mode) async {
+  Future<Success> setExceptionPauseMode(String isolateId, String mode) async {
     PauseState chromeMode;
     switch (mode) {
-      case ExceptionPauseMode.All:
+      case ExceptionPauseMode.kAll:
         chromeMode = PauseState.all;
         break;
-      case ExceptionPauseMode.Unhandled:
+      case ExceptionPauseMode.kUnhandled:
         chromeMode = PauseState.uncaught;
         break;
-      case ExceptionPauseMode.None:
+      case ExceptionPauseMode.kNone:
         chromeMode = PauseState.none;
         break;
     }
@@ -282,14 +279,14 @@ class Service {
 
   Future<Success> setName(String isolateId, String name) async {
     var isolate =
-        _vm.getIsolates().firstWhere((i) => i.id == isolateId, orElse: null);
+        _vm.isolates.firstWhere((i) => i.id == isolateId, orElse: () => null);
     if (isolate != null) isolate.name = name;
+    _realIsolatesById[isolateId]?.name = name;
     return Success();
   }
 
   Future<Success> setVMName(String name) async {
-    _vm.name = name;
-    return Success();
+    throw UnimplementedError();
   }
 
   Future<Success> streamCancel(String streamId) async {
@@ -342,29 +339,32 @@ class Service {
     // to debug.  We also assume this is the one, single Dart isolate for now.
 
     // Find a Chrome 'Isolate'.
-    final ChromeTab tab = await _chrome.getTab((ChromeTab tab) {
+    final tab = await _chrome.getTab((ChromeTab tab) {
       return !tab.isBackgroundPage &&
           !tab.isChromeExtension &&
-          !tab.url.startsWith("chrome-devtools://");
+          !tab.url.startsWith('chrome-devtools://');
     });
     _cdp = await tab.connect();
 
     // Initialize the Dart 'VM'.
-    var isolate = _createIsolate();
-    var isolateRef = isolate.toRef();
-    isolate
+    var isolate = _createIsolate()
       ..name = '${tab.url}:main()'
       ..runnable = true
-      ..pauseEvent = (Event()
-        ..kind = EventKind.Resume
-        ..isolate = isolateRef)
       ..breakpoints = [];
+    var isolateRef = IsolateRef()
+      ..id = isolate.id
+      ..name = isolate.name
+      ..number = isolate.number
+      ..type = '@Isolate';
+    isolate.pauseEvent = (Event()
+      ..kind = EventKind.kResume
+      ..isolate = isolateRef);
     _vm = VM()
-      ..getIsolates().add(isolate)
+      ..isolates.add(isolateRef)
       // TODO(vsm): This should be the DDC version, not the VM one.
       ..version = Platform.version;
 
-    _cdp.runtime.enable();
+    await _cdp.runtime.enable();
     await _cdp.runtime
         .evaluate('console.log("Dart Web Debugger Proxy Running")');
     _cdp.runtime.onConsoleAPICalled.listen((e) {
@@ -374,13 +374,13 @@ class Service {
       _streamNotify(
           'Stdout',
           Event()
-            ..kind = EventKind.WriteEvent
+            ..kind = EventKind.kWriteEvent
             ..isolate = isolateRef
             ..bytes = base64.encode(value.codeUnits));
     });
 
     // Parse and map script in the browser back to Dart libraries.
-    _cdp.debugger.enable();
+    await _cdp.debugger.enable();
     _cdp.debugger.onScriptParsed.listen((e) async {
       _processJsScript(e.script);
     });
@@ -394,21 +394,21 @@ class Service {
         var dartBreakpoint = _jsBreakpointIdToDartId[jsBreakpoint];
         var breakpoint = _objectMap[dartBreakpoint] as Breakpoint;
         event
-          ..kind = EventKind.PauseBreakpoint
+          ..kind = EventKind.kPauseBreakpoint
           ..breakpoint = breakpoint
           ..pauseBreakpoints = [breakpoint];
-      } else if (e.reason == "exception" || e.reason == "assert") {
-        event.kind = EventKind.PauseException;
+      } else if (e.reason == 'exception' || e.reason == 'assert') {
+        event.kind = EventKind.kPauseException;
       } else {
-        event.kind = EventKind.PauseInterrupted;
+        event.kind = EventKind.kPauseInterrupted;
       }
 
       // var jsFrames = e.getCallFrames().toList();
-      var jsFrames = e.params['callFrames']
-          .map((frame) => new WipCallFrame(frame))
+      var jsFrames = (e.params['callFrames'] as List)
+          .map((frame) => new WipCallFrame(frame as Map<String, dynamic>))
           .toList();
       var dartFrames = <Frame>[];
-      int index = 0;
+      var index = 0;
       for (var jsFrame in jsFrames) {
         var dartFrame = _mapFrame(jsFrame);
         if (dartFrame != null) {
@@ -425,7 +425,7 @@ class Service {
       _streamNotify(
           'Debug',
           Event()
-            ..kind = EventKind.Resume
+            ..kind = EventKind.kResume
             ..isolate = isolateRef);
     });
 
@@ -449,7 +449,7 @@ class Service {
     print(jsId);
     var jsLine = jsLocation.lineNumber;
     print(jsLine);
-    var jsColumn = jsLocation.columnNumber;
+    // var jsColumn = jsLocation.columnNumber;
     var locationData = _jsIdToLocationData[jsId];
     var locations = locationData.dartLocations;
     for (var dartUrl in locations.keys) {
@@ -460,11 +460,19 @@ class Service {
           var script = _dartUrlToScript[dartUrl];
           if (script != null) {
             return Frame()
-              ..code = (CodeRef('dummy', jsFrame.functionName, CodeKind.Dart))
+              ..code = (CodeRef()
+                ..id = 'dummy'
+                ..name = jsFrame.functionName
+                ..kind = CodeKind.kDart)
               ..location = (SourceLocation()
                 ..tokenPos = location.dartTokenPos
-                ..script = script?.toRef())
-              ..kind = FrameKind.Regular;
+                ..script = script != null
+                    ? (new ScriptRef()
+                      ..id = script.id
+                      ..type = '@Script'
+                      ..uri = script.uri)
+                    : null)
+              ..kind = FrameKind.kRegular;
           }
         }
       }
@@ -487,6 +495,9 @@ class Service {
   Future get ready => _initialized.future;
 
   VM _vm;
+  final _realIsolatesById = <String, Isolate>{};
+  final _realLibrariesByIsolateId = <String, List<Library>>{};
+  final _realScriptByLibraryId = <String, List<Script>>{};
 
   T _create<T extends Obj>(T Function() cons) {
     var id = _genId('$T');
@@ -495,9 +506,17 @@ class Service {
     return obj;
   }
 
-  Library _createLibrary() => _create(() => Library());
+  Library _createLibrary(String isolateId) {
+    var lib = _create(() => Library());
+    _realLibrariesByIsolateId.putIfAbsent(isolateId, () => []).add(lib);
+    return lib;
+  }
 
-  Script _createScript() => _create(() => Script());
+  Script _createScript(String libraryId) {
+    var script = _create(() => Script());
+    _realScriptByLibraryId.putIfAbsent(libraryId, () => []).add(script);
+    return script;
+  }
 
   int _breakpointCounter = 0;
   Breakpoint _createBreakpoint() =>
@@ -506,13 +525,14 @@ class Service {
   Isolate _createIsolate() {
     var id = _genId('Isolate');
     var isolate = Isolate()..id = id;
+    _realIsolatesById[isolate.id] = isolate;
     return isolate;
   }
 
   void _processJsScript(WipScript jsScript) async {
     // TODO(vsm): Isolates and libraries should be introspected from the browser.
-    var isolate = _vm.getIsolates().first;
-    var libraries = isolate.getLibraries();
+    var isolate = _getIsolate(_vm.isolates.first.id) as Isolate;
+    var libraries = isolate.libraries;
 
     var sourceMapUrl = jsScript.sourceMapURL;
     if (sourceMapUrl != null && sourceMapUrl.isNotEmpty) {
@@ -536,22 +556,34 @@ class Service {
             var dartSource = await _fetch(dartUrl);
             if (dartSource == null) continue;
 
-            var dartScript = _createScript()
+            var library = _createLibrary(isolate.id)
+              ..uri = dartUrl
+              ..name = p.basenameWithoutExtension(dartUrl)
+              ..scripts = <ScriptRef>[];
+            var dartScript = _createScript(library.id)
               ..uri = dartUrl
               ..tokenPosTable = locationData.dartUrlToTokenPosTable[dartUrl]
               ..source = dartSource;
             _dartIdToJsId[dartScript.id] = jsId;
             _dartUrlToScript[dartUrl] = dartScript;
-            var library = _createLibrary()
-              ..uri = dartUrl
-              ..getScripts().add(dartScript)
-              ..name = p.basenameWithoutExtension(dartUrl);
+            var libraryRef = LibraryRef()
+              ..id = library.id
+              ..name = library.name
+              ..type = '@Library'
+              ..uri = library.uri;
+            var dartScriptRef = ScriptRef()
+              ..id = dartScript.id
+              ..type = '@Script'
+              ..uri = dartScript.uri;
+            library.scripts.add(dartScriptRef);
             // TODO(vsm): Need a robust way to query for the root library.
-            if (libraries.isEmpty) isolate.rootLib = library.toRef();
-            libraries.add(library);
+            if (libraries.isEmpty) isolate.rootLib = libraryRef;
+            libraries.add(libraryRef);
           }
+        } else {
+          throw UnsupportedError('Only SingleMapping is supported.');
         }
-        _mappings.add(mapping);
+        _mappings.add(mapping as sm.SingleMapping);
       }
     }
   }
@@ -584,7 +616,7 @@ class RpcErrorData {
   String details;
 }
 
-class RpcError {
+class RpcError implements Exception {
   RpcError._(this.code, this.message, String details)
       : data = RpcErrorData(details);
 
