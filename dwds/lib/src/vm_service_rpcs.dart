@@ -350,7 +350,8 @@ class Service {
     var isolate = _createIsolate()
       ..name = '${tab.url}:main()'
       ..runnable = true
-      ..breakpoints = [];
+      ..breakpoints = []
+      ..libraries = [];
     var isolateRef = IsolateRef()
       ..id = isolate.id
       ..name = isolate.name
@@ -364,7 +365,7 @@ class Service {
       // TODO(vsm): This should be the DDC version, not the VM one.
       ..version = Platform.version;
 
-    await _cdp.runtime.enable();
+    _cdp.runtime.enable();
     await _cdp.runtime
         .evaluate('console.log("Dart Web Debugger Proxy Running")');
     _cdp.runtime.onConsoleAPICalled.listen((e) {
@@ -380,7 +381,7 @@ class Service {
     });
 
     // Parse and map script in the browser back to Dart libraries.
-    await _cdp.debugger.enable();
+    _cdp.debugger.enable();
     _cdp.debugger.onScriptParsed.listen((e) async {
       _processJsScript(e.script);
     });
