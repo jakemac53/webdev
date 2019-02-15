@@ -195,7 +195,9 @@ class Service {
   }
 
   Future<Version> getVersion() async {
-    throw UnimplementedError('getVersion');
+    return Version()
+      ..major = 3
+      ..minor = 13;
   }
 
   Future<VM> getVM() async {
